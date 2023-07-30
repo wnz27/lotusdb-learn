@@ -4,22 +4,23 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"sort"
 	"sync"
+
+	"github.com/bwmarrin/snowflake"
 
 	arenaskl "github.com/dgraph-io/badger/v4/skl"
 	"github.com/dgraph-io/badger/v4/y"
 	"github.com/rosedblabs/wal"
 )
 
-// todo in memtable
-// 1. put with multiple key/value pairs, guarantee atomicity just like rosedb
-// 2. handle the uncommitted records in wal while reopening the memtable
-
 const (
 	// the wal file name format is .SEG.%d
 	// %d is the unique id of the memtable, used to generate wal file name
 	// for example, the wal file name of memtable with id 1 is .SEG.1
-	walFileExt = ".SEG.%d"
+	walFileExt     = ".SEG.%d"
+	initialTableID = 1
 )
 
 type (
@@ -38,7 +39,7 @@ type (
 		mu      sync.RWMutex
 		wal     *wal.WAL           // write ahead log for the memtable
 		skl     *arenaskl.Skiplist // in-memory skip list
-		options *memtableOptions
+		options memtableOptions
 	}
 
 	// memtableOptions represents the configuration options for a memtable.
@@ -53,10 +54,56 @@ type (
 	}
 )
 
+func openAllMemtables(options Options) ([]*memtable, error) {
+	entries, err := os.ReadDir(options.DirPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// get all memtable ids
+	var tableIDs []int
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		var id int
+		var prefix int
+		_, err := fmt.Sscanf(entry.Name(), "%d"+walFileExt, &prefix, &id)
+		if err != nil {
+			continue
+		}
+		tableIDs = append(tableIDs, id)
+	}
+
+	if len(tableIDs) == 0 {
+		tableIDs = append(tableIDs, initialTableID)
+	}
+
+	sort.Ints(tableIDs)
+	tables := make([]*memtable, len(tableIDs))
+	for i, table := range tableIDs {
+		table, err := openMemtable(memtableOptions{
+			dirPath:         options.DirPath,
+			tableId:         uint32(table),
+			memSize:         options.MemtableSize,
+			maxBatchSize:    1000, // todo
+			walSync:         options.Sync,
+			walBytesPerSync: options.BytesPerSync,
+			walBlockCache:   options.BlockCache,
+		})
+		if err != nil {
+			return nil, err
+		}
+		tables[i] = table
+	}
+
+	return tables, nil
+}
+
 // memtable holds a wal(write ahead log), so when opening a memtable,
 // actually it open the corresponding wal file.
 // and load all entries from wal to rebuild the content of the skip list.
-func openMemtable(options *memtableOptions) (*memtable, error) {
+func openMemtable(options memtableOptions) (*memtable, error) {
 	// init skip list
 	skl := arenaskl.NewSkiplist(int64(options.memSize) + options.maxBatchSize)
 	table := &memtable{options: options, skl: skl}
@@ -75,6 +122,7 @@ func openMemtable(options *memtableOptions) (*memtable, error) {
 	}
 	table.wal = walFile
 
+	indexRecords := make(map[uint64][]*LogRecord)
 	// now we get the opened wal file, we need to load all entries
 	// from wal to rebuild the content of the skip list
 	reader := table.wal.NewReader()
@@ -87,28 +135,47 @@ func openMemtable(options *memtableOptions) (*memtable, error) {
 			return nil, err
 		}
 		record := decodeLogRecord(chunk)
-		// handle the batch id todo
-		table.skl.Put(y.KeyWithTs(record.Key, 0), y.ValueStruct{Value: record.Value, Meta: record.Type})
+		if record.Type == LogRecordBatchFinished {
+			batchId, err := snowflake.ParseBytes(record.Key)
+			if err != nil {
+				return nil, err
+			}
+			for _, idxRecord := range indexRecords[uint64(batchId)] {
+				table.skl.Put(y.KeyWithTs(idxRecord.Key, 0),
+					y.ValueStruct{Value: idxRecord.Value, Meta: record.Type})
+			}
+			delete(indexRecords, uint64(batchId))
+		} else {
+			indexRecords[record.BatchId] = append(indexRecords[record.BatchId], record)
+		}
 	}
 
 	// open and read wal file successfully, return the memtable
 	return table, nil
 }
 
-// put a key-value pair into memtable
-func (mt *memtable) put(key []byte, value []byte, deleted bool, options WriteOptions) error {
-	record := &LogRecord{Key: key, Value: value}
-	if deleted {
-		record.Type = LogRecordDeleted
-	}
-	encRecord := encodeLogRecord(record)
+// putBatch writes a batch of entries to memtable.
+func (mt *memtable) putBatch(pendingWrites map[string]*LogRecord,
+	batchId snowflake.ID, options *WriteOptions) error {
 
-	// write record into wal first.
-	if !options.DisableWal && mt.wal != nil {
-		if _, err := mt.wal.Write(encRecord); err != nil {
+	// if wal is not disabled, write to wal first to ensure durability and atomicity
+	if options == nil || !options.DisableWal {
+		for _, record := range pendingWrites {
+			record.BatchId = uint64(batchId)
+			encRecord := encodeLogRecord(record)
+			if _, err := mt.wal.Write(encRecord); err != nil {
+				return err
+			}
+		}
+		// write a record to indicate the end of the batch
+		endRecord := encodeLogRecord(&LogRecord{
+			Key:  batchId.Bytes(),
+			Type: LogRecordBatchFinished,
+		})
+		if _, err := mt.wal.Write(endRecord); err != nil {
 			return err
 		}
-		// sync wal file to disk if needed.
+		// flush wal if necessary
 		if options.Sync && !mt.options.walSync {
 			if err := mt.wal.Sync(); err != nil {
 				return err
@@ -116,9 +183,11 @@ func (mt *memtable) put(key []byte, value []byte, deleted bool, options WriteOpt
 		}
 	}
 
-	// write data into skip list in memory.
 	mt.mu.Lock()
-	mt.skl.Put(y.KeyWithTs(key, 0), y.ValueStruct{Value: value, Meta: record.Type})
+	// write to in-memory skip list
+	for key, record := range pendingWrites {
+		mt.skl.Put(y.KeyWithTs([]byte(key), 0), y.ValueStruct{Value: record.Value, Meta: record.Type})
+	}
 	mt.mu.Unlock()
 
 	return nil
@@ -130,17 +199,32 @@ func (mt *memtable) get(key []byte) (bool, []byte) {
 	mt.mu.RLock()
 	defer mt.mu.RUnlock()
 
-	var deleted bool
 	valueStruct := mt.skl.Get(y.KeyWithTs(key, 0))
-	if valueStruct.Meta == LogRecordDeleted {
-		return true, nil
-	}
-
-	deleted = valueStruct.Meta == LogRecordDeleted
+	deleted := valueStruct.Meta == LogRecordDeleted
 	return deleted, valueStruct.Value
 }
 
-// delete operation is to put a key and a special tombstone value.
-func (mt *memtable) delete(key []byte, options WriteOptions) error {
-	return mt.put(key, nil, true, options)
+func (mt *memtable) isFull() bool {
+	return mt.skl.MemSize()+mt.options.maxBatchSize >= int64(mt.options.memSize)
+}
+
+func (mt *memtable) deleteWAl() error {
+	if mt.wal != nil {
+		return mt.wal.Delete()
+	}
+	return nil
+}
+
+func (mt *memtable) close() error {
+	if mt.wal != nil {
+		return mt.wal.Close()
+	}
+	return nil
+}
+
+func (mt *memtable) sync() error {
+	if mt.wal != nil {
+		return mt.wal.Sync()
+	}
+	return nil
 }

@@ -33,15 +33,6 @@ type LogRecord struct {
 	BatchId uint64
 }
 
-// IndexRecord is the index record of the key.
-// It contains the key, the record type and the position of the record in the wal.
-// Only used in start up to rebuild the index.
-type IndexRecord struct {
-	key        []byte
-	recordType LogRecordType
-	position   *wal.ChunkPosition
-}
-
 // +-------------+-------------+-------------+--------------+-------------+--------------+
 // |    type     |  batch id   |   key size  |   value size |      key    |      value   |
 // +-------------+-------------+-------------+--------------+-------------+--------------+
@@ -101,4 +92,38 @@ func decodeLogRecord(buf []byte) *LogRecord {
 
 	return &LogRecord{Key: key, Value: value,
 		BatchId: batchId, Type: recordType}
+}
+
+// KeyPosition is the position of the key in the value log.
+type KeyPosition struct {
+	key       []byte
+	partition uint32
+	position  *wal.ChunkPosition
+}
+
+// ValueLogRecord is the record of the key/value pair in the value log.
+type ValueLogRecord struct {
+	key   []byte
+	value []byte
+}
+
+func encodeValueLogRecord(record *ValueLogRecord) []byte {
+	buf := make([]byte, 4+len(record.key)+len(record.value))
+	index := 0
+	binary.LittleEndian.PutUint32(buf[index:index+4], uint32(len(record.key)))
+	index += 4
+
+	copy(buf[index:index+len(record.key)], record.key)
+	index += len(record.key)
+	copy(buf[index:], record.value)
+	return buf
+}
+
+func decodeValueLogRecord(buf []byte) *ValueLogRecord {
+	keyLen := binary.LittleEndian.Uint32(buf[:4])
+	key := make([]byte, keyLen)
+	copy(key, buf[4:4+keyLen])
+	value := make([]byte, uint32(len(buf))-keyLen-4)
+	copy(value, buf[4+keyLen:])
+	return &ValueLogRecord{key: key, value: value}
 }

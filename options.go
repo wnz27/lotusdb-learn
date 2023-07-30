@@ -1,6 +1,14 @@
 package lotusdb
 
+<<<<<<< HEAD
 import "os"
+=======
+import (
+	"os"
+
+	"github.com/cespare/xxhash/v2"
+)
+>>>>>>> main
 
 type Options struct {
 	// DirPath specifies the directory path where all the database files will be stored.
@@ -32,6 +40,14 @@ type Options struct {
 
 	// BytesPerSync specifies the number of bytes to write before calling fsync.
 	BytesPerSync uint32
+
+	// PartitionNum specifies the number of partitions to use for the index and value log.
+	PartitionNum int
+
+	// KeyHashFunction specifies the hash function for sharding.
+	// It is used to determine which partition a key belongs to.
+	// Default value is xxhash.
+	KeyHashFunction func([]byte) uint64
 
 	// ValueLogFileSize size of a single value log file.
 	// Default value is 1GB.
@@ -68,11 +84,51 @@ type WriteOptions struct {
 	DisableWal bool
 }
 
+<<<<<<< HEAD
 var DefaultOptions = Options{
 	DirPath:      tempDBDir(),
 	BlockCache:   64 * 1024 * 1024, // 64 MB
 	Sync:         false,
 	BytesPerSync: 0,
+=======
+// IteratorOptions is the options for the iterator.
+type IteratorOptions struct {
+	// Prefix filters the keys by prefix.
+	Prefix []byte
+
+	// Reverse indicates whether the iterator is reversed.
+	// false is forward, true is backward.
+	Reverse bool
+}
+
+const (
+	B  = 1
+	KB = 1024 * B
+	MB = 1024 * KB
+	GB = 1024 * MB
+)
+
+var DefaultOptions = Options{
+	DirPath:          tempDBDir(),
+	MemtableSize:     64 * MB,
+	MemtableNums:     15,
+	BlockCache:       64 * MB,
+	Sync:             false,
+	BytesPerSync:     0,
+	PartitionNum:     3,
+	KeyHashFunction:  xxhash.Sum64,
+	ValueLogFileSize: 1 * GB,
+}
+
+var DefaultBatchOptions = BatchOptions{
+	Sync:     true,
+	ReadOnly: false,
+}
+
+var DefaultIteratorOptions = IteratorOptions{
+	Prefix:  nil,
+	Reverse: false,
+>>>>>>> main
 }
 
 func tempDBDir() string {
